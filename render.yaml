@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: mynewzabbix
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+    envVars:
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: APP_USERS_JSON
+        sync: false
+      - key: ZABBIX_URL
+        value: http://52.29.15.174/zabbix/api_jsonrpc.php
+      - key: ZABBIX_USERNAME
+        sync: false
+      - key: ZABBIX_PASSWORD
+        sync: false
+      - key: ZABBIX_GROUP_ID
+        value: "19"
+      - key: PRINTBOX_CONFIG_JSON
+        sync: false
