@@ -4,6 +4,7 @@ const summary = $('#summary'), locations = $('#locations'), mapPanel = $('#mapPa
 const statusBox = $('#status'), search = $('#search'), area = $('#area'), severity = $('#severity'), category = $('#category');
 const resultCount = $('#resultCount'), updated = $('#updated'), listViewButton = $('#listView'), mapViewButton = $('#mapView');
 
+const infoModal = $('#infoModal'), infoTitle = $('#infoTitle'), infoContent = $('#infoContent'), closeInfoButton = $('#closeInfo');
 let dataset = null, timer = null, selectedView = 'list', problemMap = null, markerLayer = null;
 const areaNames = {vienna:'Wien', graz:'Graz', linz:'Linz', rest:'Rest'};
 const severityNames = ['Nicht klassifiziert','Information','Warnung','Durchschnitt','Hoch','Katastrophe'];
@@ -55,6 +56,44 @@ function hiddenActivity(problem) {
 }
 function dotClass(problem) { return problem.hidden?'hidden-dot':'sev-'+problem.priority; }
 
+const infoGroups = [
+  ['Standort', ['ff','Betreiber','Label','Name','PLZ','Ort','besucht am']],
+  ['Druck & Verbrauch', ['Papier vorr.','Gerät','Tinte','K','M','C','Y','CODE']],
+  ['Geräte & Funktionen', ['PL1','PL2','PL3','PL4','Scanner','PC','ZAHLUNG','Ventilatoren','Bill Acc.']],
+  ['Netzwerk', ['Internet','Provider','YessNr','Master']],
+  ['Kontakt & Zugang', ['Telefon','Ansprechpartner','Standort der Printbox','Schlüssel']]
+];
+const infoLabels = {'ff':'Printbox','besucht am':'Zuletzt besucht','Papier vorr.':'Papiervorrat','Bill Acc.':'Scheinakzeptor','YessNr':'Yess-Nummer','Standort der Printbox':'Position der Printbox','Schlüssel':'Schlüsselhinweis'};
+
+function infoButton(host,label) {
+  return '<button class="info-trigger" type="button" data-host="'+escapeHtml(host)+'">'+escapeHtml(label||'Info')+'</button>';
+}
+function renderInfoGroup(title,keys,info) {
+  const fields=keys.filter(key=>info[key]).map(key=>
+    '<div class="info-field"><dt>'+escapeHtml(infoLabels[key]||key)+'</dt><dd>'+escapeHtml(info[key]).replaceAll(String.fromCharCode(10),'<br>')+'</dd></div>'
+  ).join('');
+  return fields?'<section class="info-group"><h3>'+escapeHtml(title)+'</h3><dl>'+fields+'</dl></section>':'';
+}
+function openInfo(host) {
+  if (!dataset) return;
+  const problem=dataset.problems.find(item=>item.host===host&&item.terminalInfo);
+  if (!problem) return;
+  const info=problem.terminalInfo;
+  const knownKeys=new Set(infoGroups.flatMap(group=>group[1]));
+  const extraKeys=Object.keys(info).filter(key=>!knownKeys.has(key)&&info[key]);
+  infoTitle.textContent=host;
+  infoContent.innerHTML=infoGroups.map(group=>renderInfoGroup(group[0],group[1],info)).join('')+
+    renderInfoGroup('Weitere Angaben',extraKeys,info);
+  infoModal.hidden=false;
+  infoModal.setAttribute('aria-hidden','false');
+  document.body.classList.add('modal-open');
+  closeInfoButton.focus();
+}
+function closeInfo() {
+  infoModal.hidden=true;
+  infoModal.setAttribute('aria-hidden','true');
+  document.body.classList.remove('modal-open');
+}
 function detailProblem(problem) {
   return '<div class="detail-problem"><i class="severity-dot '+dotClass(problem)+'"></i><div><strong>'+
     escapeHtml(problem.description)+'</strong><small>'+escapeHtml(categoryNames[problem.category]||categoryNames.other)+' · '+
@@ -62,21 +101,22 @@ function detailProblem(problem) {
 }
 function hostRow(host,index) {
   const main=host.main, count=host.problems.length;
-  return '<div class="location-row-wrap"><button class="location-row" type="button" aria-expanded="false" aria-controls="details-'+index+'" data-details="details-'+index+'">'+
+  const infoCell=main.terminalInfo?'<span class="info-cell">'+infoButton(host.host,'Standortinfo')+'</span>':'<span class="info-cell no-info">–</span>';
+  return '<div class="location-row-wrap"><div class="location-row" role="button" tabindex="0" aria-expanded="false" aria-controls="details-'+index+'" data-details="details-'+index+'">'+
     '<span class="cell host-cell"><i class="severity-dot '+dotClass(main)+'"></i><strong>'+escapeHtml(host.host)+'</strong><small>'+(count>1?count+' Probleme':'1 Problem')+'</small></span>'+
     '<span class="cell main-problem"><strong>'+escapeHtml(main.description)+'</strong><small>'+escapeHtml(categoryNames[main.category]||categoryNames.other)+' · '+escapeHtml(severityNames[main.priority])+'</small></span>'+
-    '<span class="cell region-cell">'+escapeHtml(areaNames[main.area]||areaNames.rest)+'</span><span class="cell since-cell">'+age(main.since)+'</span><span class="expand-icon">⌄</span></button>'+
+    infoCell+'<span class="cell region-cell">'+escapeHtml(areaNames[main.area]||areaNames.rest)+'</span><span class="cell since-cell">'+age(main.since)+'</span><span class="expand-icon">⌄</span></div>'+
     '<div class="location-details" id="details-'+index+'" hidden><div class="details-title">Alle Probleme dieses Standorts</div>'+
     [...host.problems].sort(compareProblems).map(detailProblem).join('')+'</div></div>';
-}
-function renderList(hosts) {
-  locations.innerHTML = hosts.length?'<div class="problem-table"><div class="problem-table-head"><span>Standortname</span><span>Problem</span><span>Region</span><span>Seit wann</span><span></span></div>'+
+}function renderList(hosts) {
+  locations.innerHTML = hosts.length?'<div class="problem-table"><div class="problem-table-head"><span>Standortname</span><span>Problem</span><span>Info</span><span>Region</span><span>Seit wann</span><span></span></div>'+
     hosts.map(hostRow).join('')+'</div>':'<div class="status">Keine passenden Probleme gefunden.</div>';
 }
 function mapPopup(host) {
   const main=host.main;
   return '<div class="map-popup"><div class="map-popup-title"><i class="severity-dot '+dotClass(main)+'"></i><strong>'+escapeHtml(host.host)+'</strong></div>'+
     '<div class="map-popup-meta">'+escapeHtml(areaNames[main.area]||areaNames.rest)+(main.address?' · '+escapeHtml(main.address):'')+'</div>'+
+    (main.terminalInfo?infoButton(host.host,'Standortinfo'):'')+
     [...host.problems].sort(compareProblems).map(problem =>
       '<div class="map-popup-problem"><strong>'+escapeHtml(problem.description)+'</strong><span>'+escapeHtml(severityNames[problem.priority])+' · '+age(problem.since)+'</span>'+hiddenActivity(problem)+'</div>'
     ).join('')+'</div>';
@@ -132,10 +172,23 @@ function selectView(view) {
   render();
 }
 locations.addEventListener('click',event=>{
+  if(event.target.closest('.info-trigger'))return;
   const row=event.target.closest('.location-row'); if(!row)return;
   const details=document.getElementById(row.dataset.details),open=row.getAttribute('aria-expanded')==='true';
   row.setAttribute('aria-expanded',String(!open)); details.hidden=open;
 });
+locations.addEventListener('keydown',event=>{
+  const row=event.target.closest('.location-row');
+  if(!row||event.target.closest('.info-trigger')||(event.key!=='Enter'&&event.key!==' '))return;
+  event.preventDefault();row.click();
+});
+document.addEventListener('click',event=>{
+  const trigger=event.target.closest('.info-trigger');
+  if(trigger){event.preventDefault();event.stopPropagation();openInfo(trigger.dataset.host);return}
+  if(event.target.closest('[data-close-info]'))closeInfo();
+});
+closeInfoButton.addEventListener('click',closeInfo);
+document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!infoModal.hidden)closeInfo()});
 async function load(force=false) {
   statusBox.textContent='Probleme werden aus Zabbix und Printbox geladen …'; statusBox.className='status';
   try {

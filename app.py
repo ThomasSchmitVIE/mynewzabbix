@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import io
+from zipfile import BadZipFile
 import hashlib
 import hmac
 import json
@@ -16,16 +18,20 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 from bs4 import BeautifulSoup
 
 
 APP_DIR = Path(__file__).resolve().parent
 ZABBIX_URL = os.environ.get("ZABBIX_URL", "http://52.29.15.174/zabbix/api_jsonrpc.php")
 CACHE_SECONDS = 45
+SHEET_XLSX_URL = os.environ.get("LOCATION_SHEET_XLSX_URL", "https://docs.google.com/spreadsheets/d/1PzJVMVrupZ8aOGr0StOrtelEUYxdyMnk/export?format=xlsx")
 cache_lock = threading.Lock()
 problem_cache = {"time": 0.0, "data": None}
 location_cache = {"time": 0.0, "locations": {}}
 hidden_cache = {"time": 0.0, "problems": []}
+sheet_cache = {"time": 0.0, "rows": {}}
 
 
 class DashboardError(RuntimeError):
@@ -146,6 +152,56 @@ def labels_match(left, right):
     short, long = (a, b) if len(a) < len(b) else (b, a)
     return any(long[:index] + long[index + 1:] == short for index in range(len(long)))
 
+def sheet_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m.%Y")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def select_terminal_info(rows, hosts):
+    result = {}
+    for host in hosts:
+        match = rows.get(normalize_label(host))
+        if not match:
+            match = next((row for row in rows.values() if labels_match(host, row.get("Label", ""))), None)
+        if match:
+            result[host] = match
+    return result
+
+
+def fetch_terminal_info(hosts, force=False):
+    now = time.monotonic()
+    with cache_lock:
+        if not force and sheet_cache["time"] and now - sheet_cache["time"] < 600:
+            rows = sheet_cache["rows"]
+            return select_terminal_info(rows, hosts)
+    try:
+        response = requests.get(SHEET_XLSX_URL, timeout=30)
+        response.raise_for_status()
+        workbook = load_workbook(io.BytesIO(response.content), read_only=True, data_only=True)
+        sheet = workbook["Terminals"] if "Terminals" in workbook.sheetnames else workbook.active
+        values = sheet.iter_rows(values_only=True)
+        headers = [sheet_text(value) for value in next(values)]
+        rows = {}
+        for source_values in values:
+            row = {
+                header: sheet_text(value)
+                for header, value in zip(headers, source_values)
+                if header and sheet_text(value)
+            }
+            label = row.get("Label", "")
+            if label:
+                rows[normalize_label(label)] = row
+        workbook.close()
+        with cache_lock:
+            sheet_cache.update(time=time.monotonic(), rows=rows)
+        return select_terminal_info(rows, hosts)
+    except (StopIteration, ValueError, KeyError, BadZipFile, InvalidFileException, requests.RequestException):
+        return {}
 
 def report_locations(html, tbody_index):
     bodies = BeautifulSoup(html, "html.parser").find_all("tbody")
@@ -263,6 +319,9 @@ def fetch_problems(force=False):
             lat=location.get("lat"), lon=location.get("lon"),
         )
     problems.extend(fetch_hidden_problems({problem["host"] for problem in problems}, force))
+    terminal_info = fetch_terminal_info({problem["host"] for problem in problems}, force)
+    for problem in problems:
+        problem["terminalInfo"] = terminal_info.get(problem["host"])
     problems.sort(key=lambda x: (-x["priority"], x["since"]))
     result = {"problems": problems, "updatedAt": int(time.time())}
     with cache_lock:
