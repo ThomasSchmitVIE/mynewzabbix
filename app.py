@@ -24,7 +24,7 @@ ZABBIX_URL = os.environ.get("ZABBIX_URL", "http://52.29.15.174/zabbix/api_jsonrp
 CACHE_SECONDS = 45
 cache_lock = threading.Lock()
 problem_cache = {"time": 0.0, "data": None}
-area_cache = {"time": 0.0, "areas": {}}
+location_cache = {"time": 0.0, "locations": {}}
 hidden_cache = {"time": 0.0, "problems": []}
 
 
@@ -85,11 +85,27 @@ def classify_area(address):
     return "rest"
 
 
-def fetch_areas(hosts):
+def location_fields(soup):
+    fields = {}
+    for row in soup.select("tr"):
+        cells = row.find_all(["th", "td"])
+        if len(cells) >= 2:
+            fields[cells[0].get_text(" ", strip=True).casefold()] = cells[1].get_text(" ", strip=True)
+    address = fields.get("location address", "")
+    try:
+        lat = float(fields.get("location lat", "").replace(",", "."))
+        lon = float(fields.get("location long", "").replace(",", "."))
+    except ValueError:
+        lat, lon = None, None
+    return {"area": classify_area(address), "address": address, "lat": lat, "lon": lon}
+
+
+def fetch_locations(hosts):
     now = time.monotonic()
     with cache_lock:
-        if area_cache["areas"] and now - area_cache["time"] < 21600:
-            return {host: area_cache["areas"].get(host, "rest") for host in hosts}
+        cached = location_cache["locations"]
+        if cached and set(hosts).issubset(cached) and now - location_cache["time"] < 21600:
+            return {host: cached[host] for host in hosts}
     try:
         config = json.loads(os.environ.get("PRINTBOX_CONFIG_JSON", ""))
         with requests.Session() as session:
@@ -108,20 +124,16 @@ def fetch_areas(hosts):
                             label = link.get_text(" ", strip=True).split(" - ", 1)[0]
                             if label in hosts: links[label] = link["href"]
                 if len(rows) < 30: break
-            areas = {}
+            locations = {}
             for host, href in links.items():
                 response = session.get(root + href, timeout=25); response.raise_for_status()
-                address = ""; soup = BeautifulSoup(response.text, "html.parser")
-                for row in soup.select("tr"):
-                    cells = row.find_all(["th", "td"])
-                    if len(cells) >= 2 and cells[0].get_text(" ", strip=True) == "Location Address":
-                        address = cells[1].get_text(" ", strip=True); break
-                areas[host] = classify_area(address)
-        with cache_lock: area_cache.update(time=time.monotonic(), areas=areas)
-        return {host: areas.get(host, "rest") for host in hosts}
+                locations[host] = location_fields(BeautifulSoup(response.text, "html.parser"))
+        for host in hosts:
+            locations.setdefault(host, {"area": "rest", "address": "", "lat": None, "lon": None})
+        with cache_lock: location_cache.update(time=time.monotonic(), locations=locations)
+        return {host: locations[host] for host in hosts}
     except (ValueError, KeyError, json.JSONDecodeError, requests.RequestException, DashboardError):
-        return {host: "rest" for host in hosts}
-
+        return {host: {"area": "rest", "address": "", "lat": None, "lon": None} for host in hosts}
 
 def normalize_label(value):
     return re.sub(r"[^A-Z0-9]", "", value.upper())
@@ -198,13 +210,11 @@ def fetch_hidden_problems(zabbix_hosts, force=False):
             days = (datetime.now() - latest).total_seconds() / 86400 if latest else 9999
             if days < 5: return None
             deployment_response = requests.get(root + device["deployment"], cookies=cookies, headers=headers, timeout=25); deployment_response.raise_for_status()
-            address = ""; soup = BeautifulSoup(deployment_response.text, "html.parser")
-            for row in soup.select("tr"):
-                cells = row.find_all(["th", "td"])
-                if len(cells) >= 2 and cells[0].get_text(" ", strip=True) == "Location Address": address = cells[1].get_text(" ", strip=True); break
+            location = location_fields(BeautifulSoup(deployment_response.text, "html.parser"))
+            address, lat, lon = location["address"], location["lat"], location["lon"]
             priority = 4 if days >= 10 else 2
             since = int(latest.timestamp()) if latest else 0
-            return {"id": f"hidden-{device['id']}", "host": label, "hostId": device["id"], "description": f"Keine Drucke oder Einzahlungen seit {int(days)} Tagen", "priority": priority, "since": since, "category": "hidden", "area": classify_area(address), "hidden": True, "lastPrint": printed.isoformat() if printed else None, "lastFillup": fillup.isoformat() if fillup else None}
+            return {"id": f"hidden-{device['id']}", "host": label, "hostId": device["id"], "description": f"Keine Drucke oder Einzahlungen seit {int(days)} Tagen", "priority": priority, "since": since, "category": "hidden", "area": classify_area(address), "address": address, "lat": lat, "lon": lon, "hidden": True, "lastPrint": printed.isoformat() if printed else None, "lastFillup": fillup.isoformat() if fillup else None}
 
         hidden = []
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -245,8 +255,13 @@ def fetch_problems(force=False):
             "description": description, "priority": int(trigger["priority"]),
             "since": int(trigger["lastchange"]), "category": category(description),
         })
-    areas = fetch_areas({problem["host"] for problem in problems})
-    for problem in problems: problem["area"] = areas.get(problem["host"], "rest")
+    locations = fetch_locations({problem["host"] for problem in problems})
+    for problem in problems:
+        location = locations.get(problem["host"], {})
+        problem.update(
+            area=location.get("area", "rest"), address=location.get("address", ""),
+            lat=location.get("lat"), lon=location.get("lon"),
+        )
     problems.extend(fetch_hidden_problems({problem["host"] for problem in problems}, force))
     problems.sort(key=lambda x: (-x["priority"], x["since"]))
     result = {"problems": problems, "updatedAt": int(time.time())}
