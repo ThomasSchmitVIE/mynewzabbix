@@ -278,6 +278,12 @@ class Handler(SimpleHTTPRequestHandler):
         value = super().guess_type(path)
         return f"{value}; charset=utf-8" if value in {"text/html", "text/css", "text/javascript"} else value
 
+    def end_headers(self):
+        path = urlparse(self.path).path
+        if path == "/" or path.endswith((".html", ".css", ".js")):
+            self.send_header("Cache-Control", "no-cache, must-revalidate")
+        super().end_headers()
+
     def send_json(self, payload, status=HTTPStatus.OK, cookie=None):
         body = json.dumps(payload, ensure_ascii=False).encode()
         self.send_response(status)
