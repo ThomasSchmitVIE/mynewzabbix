@@ -20,3 +20,5 @@ services:
         value: "19"
       - key: PRINTBOX_CONFIG_JSON
         sync: false
+      - key: LOCATION_SHEET_FILE_ID
+        value: "1PzJVMVrupZ8aOGr0StOrtelEUYxdyMnk"

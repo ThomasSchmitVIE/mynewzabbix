@@ -18,6 +18,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+from google.auth.exceptions import GoogleAuthError
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import service_account
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 from bs4 import BeautifulSoup
@@ -26,7 +29,9 @@ from bs4 import BeautifulSoup
 APP_DIR = Path(__file__).resolve().parent
 ZABBIX_URL = os.environ.get("ZABBIX_URL", "http://52.29.15.174/zabbix/api_jsonrpc.php")
 CACHE_SECONDS = 45
-SHEET_XLSX_URL = os.environ.get("LOCATION_SHEET_XLSX_URL", "https://docs.google.com/spreadsheets/d/1PzJVMVrupZ8aOGr0StOrtelEUYxdyMnk/export?format=xlsx")
+SHEET_FILE_ID = os.environ.get("LOCATION_SHEET_FILE_ID", "1PzJVMVrupZ8aOGr0StOrtelEUYxdyMnk")
+SHEET_SECRET_FILE = Path(os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "/etc/secrets/google-service-account.json"))
+DRIVE_READONLY_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 cache_lock = threading.Lock()
 problem_cache = {"time": 0.0, "data": None}
 location_cache = {"time": 0.0, "locations": {}}
@@ -173,6 +178,50 @@ def select_terminal_info(rows, hosts):
     return result
 
 
+def google_service_account_info():
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return json.loads(base64.b64decode(raw).decode("utf-8"))
+    if SHEET_SECRET_FILE.is_file():
+        with SHEET_SECRET_FILE.open(encoding="utf-8") as source:
+            return json.load(source)
+    raise DashboardError("Google-Service-Account ist nicht eingerichtet.")
+
+
+def download_terminal_workbook():
+    credentials = service_account.Credentials.from_service_account_info(
+        google_service_account_info(), scopes=[DRIVE_READONLY_SCOPE]
+    )
+    credentials.refresh(GoogleAuthRequest())
+    headers = {"Authorization": f"Bearer {credentials.token}"}
+    metadata_response = requests.get(
+        f"https://www.googleapis.com/drive/v3/files/{SHEET_FILE_ID}",
+        params={"fields": "id,name,mimeType", "supportsAllDrives": "true"},
+        headers=headers,
+        timeout=30,
+    )
+    metadata_response.raise_for_status()
+    metadata = metadata_response.json()
+    if metadata.get("mimeType") == "application/vnd.google-apps.spreadsheet":
+        workbook_response = requests.get(
+            f"https://www.googleapis.com/drive/v3/files/{SHEET_FILE_ID}/export",
+            params={"mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+            headers=headers,
+            timeout=30,
+        )
+    else:
+        workbook_response = requests.get(
+            f"https://www.googleapis.com/drive/v3/files/{SHEET_FILE_ID}",
+            params={"alt": "media", "supportsAllDrives": "true"},
+            headers=headers,
+            timeout=30,
+        )
+    workbook_response.raise_for_status()
+    return workbook_response.content
+
 def fetch_terminal_info(hosts, force=False):
     now = time.monotonic()
     with cache_lock:
@@ -180,9 +229,7 @@ def fetch_terminal_info(hosts, force=False):
             rows = sheet_cache["rows"]
             return select_terminal_info(rows, hosts)
     try:
-        response = requests.get(SHEET_XLSX_URL, timeout=30)
-        response.raise_for_status()
-        workbook = load_workbook(io.BytesIO(response.content), read_only=True, data_only=True)
+        workbook = load_workbook(io.BytesIO(download_terminal_workbook()), read_only=True, data_only=True)
         sheet = workbook["Terminals"] if "Terminals" in workbook.sheetnames else workbook.active
         values = sheet.iter_rows(values_only=True)
         headers = [sheet_text(value) for value in next(values)]
@@ -200,7 +247,7 @@ def fetch_terminal_info(hosts, force=False):
         with cache_lock:
             sheet_cache.update(time=time.monotonic(), rows=rows)
         return select_terminal_info(rows, hosts)
-    except (StopIteration, ValueError, KeyError, BadZipFile, InvalidFileException, requests.RequestException):
+    except (StopIteration, ValueError, KeyError, OSError, BadZipFile, InvalidFileException, GoogleAuthError, requests.RequestException, DashboardError):
         return {}
 
 def report_locations(html, tbody_index):
